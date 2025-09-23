@@ -1,3 +1,7 @@
+## 6.3.98
+
+- Forward OTA update, no bootloader
+
 ## 6.3.4
 
 ### BUGFIXES
