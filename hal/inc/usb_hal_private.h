@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018 Particle Industries, Inc.  All rights reserved.
+ * Copyright (c) 2026 Particle Industries, Inc.  All rights reserved.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -15,25 +15,24 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+// This header defines private USART HAL APIs that may be implemented only on certain platforms
+// and are not intended to be exported.
 #pragma once
 
-#include "system_control.h"
+#include "usb_hal.h"
+#include <FreeRTOS.h>
+#include <event_groups.h>
+#include "system_tick_hal.h"
 
-namespace particle {
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
 
-namespace ctrl {
+int hal_usb_cdc_pvt_get_event_group_handle(EventGroupHandle_t* handle);
+int hal_usb_cdc_pvt_wait_event(uint32_t events, system_tick_t timeout);
+int hal_usb_cdc_pvt_send_data(const char* data, size_t size);
+int hal_usb_cdc_pvt_recv_data(char* data, size_t size);
 
-namespace cellular {
-
-int setAccessPoint(ctrl_request* req);
-int getAccessPoint(ctrl_request* req);
-int setActiveSim(ctrl_request* req);
-int getActiveSim(ctrl_request* req);
-int getIccid(ctrl_request* req);
-int sendApdu(ctrl_request* req);
-
-} // particle::ctrl::wifi
-
-} // particle::ctrl
-
-} // particle
+#ifdef __cplusplus
+}
+#endif // __cplusplus

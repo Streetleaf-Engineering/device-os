@@ -37,11 +37,14 @@ LOG_SOURCE_CATEGORY("ncp.client");
 #include "deviceid_hal.h"
 
 #include "stream_util.h"
+#include "str_util.h"
 
 #include "spark_wiring_interrupts.h"
 
 #include <algorithm>
 #include <limits>
+#include <cstdio>
+#include <cstring>
 #include <lwip/memp.h>
 
 #include "ncp_env_var.h"
@@ -147,9 +150,12 @@ const int CGDCONT_ATTEMPTS = 5;
 
 const int COPS_MAX_RETRY_CNT = 3;
 
+const int APDU_CHANNEL_TIMEOUT = 5 * 60 * 1000;
+
 } // anonymous
 
-QuectelNcpClient::QuectelNcpClient() {
+QuectelNcpClient::QuectelNcpClient() :
+        apduChannelTimer_(apduChannelTimeoutCb, this) {
 }
 
 QuectelNcpClient::~QuectelNcpClient() {
@@ -398,6 +404,10 @@ int QuectelNcpClient::off() {
 
     ready_ = false;
     ncpState(NcpState::OFF);
+
+    apduChannelTimer_.stop();
+    apduChannel_ = 0;
+
     return SYSTEM_ERROR_NONE;
 }
 
@@ -1047,17 +1057,23 @@ int QuectelNcpClient::setupBands() {
     char qbandGsmStr[4+1] = {};
     char qbandLteStr[32+1] = {};
     char qbandCatNbStr[32+1] = {};
-    // BG95_M5: +QCFG: "band",0xf,0x100002000000000f0e189f,0x10004200000000090e189f <GSM>,<CAT-M1-1-128>,<CAT-NB-1-128>
-    auto retBand = CHECK_PARSER(respBand.scanf("+QCFG: \"band\",0x%4[^,],0x%32[^,],0x%32[^,]", qbandGsmStr, qbandLteStr, qbandCatNbStr));
+    char qbandNtnStr[3+1] = {};
+    // BG95_M5: +QCFG: "band",0xf,0x100002000000000f0e189f,0x10004200000000090e189f     <GSM>,<CAT-M1-1-128>,<CAT-NB-1-128>
+    // BG95_S5: +QCFG: "band",0xf,0x100002000000000f0e189f,0x10004200000000090e189f,0x7 <GSM>,<CAT-M1-1-128>,<CAT-NB-1-128>,<NTN_NB-IoT_bandval>
+    auto retBand = CHECK_PARSER(respBand.scanf("+QCFG: \"band\",0x%4[^,],0x%32[^,],0x%32[^,],%s", qbandGsmStr, qbandLteStr, qbandCatNbStr, qbandNtnStr));
     CHECK_PARSER_OK(respBand.readResult());
-
-    if (retBand == 3) {
+    if (retBand == 3 || retBand == 4) {
         CellularBandMask bandsCurrent(qbandLteStr);
 
         if (bandsCurrent != envPreferredBands) {
             // Apply band changes immediately, no reboot required.
             CHECK_PARSER_OK(setModuleFunctionality(CellularFunctionality::AIRPLANE, true /* check */));
-            CHECK_PARSER_OK(parser_.execCommand("AT+QCFG=\"band\",%s,%s,%s,1", qbandGsmStr, (const char*)envPreferredBands.toString(), qbandCatNbStr));
+            if (retBand == 3) {
+                CHECK_PARSER_OK(parser_.execCommand("AT+QCFG=\"band\",%s,%s,%s,1", qbandGsmStr, (const char*)envPreferredBands.toString(), qbandCatNbStr));    
+            } else if (retBand == 4) {
+                CHECK_PARSER_OK(parser_.execCommand("AT+QCFG=\"band\",%s,%s,%s,%s,1", qbandGsmStr, (const char*)envPreferredBands.toString(), qbandCatNbStr, qbandNtnStr));
+            }
+            
             CHECK_PARSER_OK(setModuleFunctionality(CellularFunctionality::FULL, false /* check */));
         }
     }
@@ -1226,6 +1242,7 @@ int QuectelNcpClient::configurePlmn() {
 
     auto ncp_id = ncpId();
     if (ncp_id != PLATFORM_NCP_QUECTEL_BG95_M5 &&
+            ncp_id != PLATFORM_NCP_QUECTEL_BG95_S5 &&
             ncp_id != PLATFORM_NCP_QUECTEL_EG91_NAX &&
             ncp_id != PLATFORM_NCP_QUECTEL_EG91_EX &&
             ncp_id != PLATFORM_NCP_QUECTEL_EG91_E) {
@@ -1424,11 +1441,19 @@ int QuectelNcpClient::initReady(ModemState state) {
 
     configuredPlmn_ = false;
     if (ncpId() == PLATFORM_NCP_QUECTEL_BG95_M5 ||
+            ncpId() == PLATFORM_NCP_QUECTEL_BG95_S5 ||
             ncpId() == PLATFORM_NCP_QUECTEL_BG96 ||
             ncpId() == PLATFORM_NCP_QUECTEL_EG91_NAX ||
             ncpId() == PLATFORM_NCP_QUECTEL_EG91_E ||
             ncpId() == PLATFORM_NCP_QUECTEL_EG91_EX) {
         CHECK(setupBands());
+    }
+
+    // Make sure at least some of the APDU channels are closed and available for application or
+    // system use. Channel 1 appears to be always open at this point as if the modem itself uses
+    // it, so let's leave it as is just in case
+    for (int i = 2; i <= 3; ++i) {
+        closeApduChannel(i);
     }
 
     if (state != ModemState::MuxerAtChannel) {
@@ -2103,6 +2128,149 @@ int QuectelNcpClient::urcs(bool enable) {
 
 int QuectelNcpClient::startNcpFwUpdate(bool update) {
     return 0;
+}
+
+int QuectelNcpClient::sendApdu(const char* cmdBuf, size_t cmdSize, char* respBuf, size_t& respSize, bool autoClose) {
+    if (cmdSize > MAX_APDU_SIZE) {
+        return SYSTEM_ERROR_INVALID_ARGUMENT;
+    }
+
+    NcpClientLock lock(this);
+    CHECK(checkParser());
+
+    int cmdChannel = -1; // Channel number as encoded in the CLA field
+    bool openChannel = false; // If true, this command opens a channel
+    bool closeChannel = false; // If true, this command closes a channel
+
+    if (cmdSize >= 4) {
+        uint8_t cla = cmdBuf[0];
+        if (!(cla & 0x60)) {
+            cmdChannel = cla & 0x03; // Standard encoding
+        } else if ((cla & 0x60) == 0x40) {
+            cmdChannel = (cla & 0x0f) + 4; // Extended encoding
+        }
+        if (cla == 0 && cmdBuf[1] == '\x70' /* INS */) {
+            if (cmdBuf[2] == '\x00' /* P1 */) {
+                openChannel = true;
+            } else if (cmdBuf[2] == '\x80') {
+                closeChannel = true;
+            }
+        }
+    }
+
+    if (openChannel && autoClose && apduChannel_ > 0) {
+        LOG(INFO, "Closing existing APDU channel %d", apduChannel_);
+        int r = closeApduChannel(apduChannel_);
+        if (r < 0) {
+            LOG(ERROR, "Error while closing APDU channel: %d", r);
+        }
+        apduChannel_ = 0;
+    }
+
+    auto cmd = parser_.command();
+    cmd.printf("AT+CSIM=%d,\"", (int)(cmdSize * 2));
+
+    char strBuf[MAX_APDU_SIZE * 2 + 50]; // Add some room for AT command framing
+    toHex(cmdBuf, cmdSize, strBuf, sizeof(strBuf));
+    cmd.print(strBuf);
+    cmd.print("\"");
+
+    auto resp = cmd.send();
+    // Not using AtResponse::scanf() as it may allocate memory dynamically
+    CHECK_PARSER(resp.readLine(strBuf, sizeof(strBuf)));
+    CHECK_PARSER_OK(resp.readResult());
+
+    int respHexSize = 0;
+    int r = std::sscanf(strBuf, "+CSIM: %d", &respHexSize);
+    if (r != 1) {
+        return SYSTEM_ERROR_BAD_DATA;
+    }
+    auto respHex = std::strchr(strBuf, '"');
+    if (!respHex) {
+        return SYSTEM_ERROR_BAD_DATA;
+    }
+    ++respHex;
+    auto s = std::strchr(respHex, '"');
+    if (!s || s - respHex != respHexSize) {
+        return SYSTEM_ERROR_BAD_DATA;
+    }
+
+    if (openChannel || closeChannel) {
+        if (respHexSize >= 4) {
+            char sw[2]; // Status
+            size_t n = fromHex(respHex + respHexSize - 4, 4, sw, sizeof(sw));
+            if (n == 2 && sw[0] == '\x90' /* SW1 */ && sw[1] == '\x00' /* SW2 */) {
+                if (openChannel) {
+                    int channel = 0;
+                    if (respHexSize == 6) {
+                        // The channel number was assigned by the UICC
+                        char c = 0;
+                        n = fromHex(respHex, 2, &c, 1);
+                        if (n == 1) {
+                            channel = (unsigned char)c;
+                        }
+                    } else {
+                        // The channel number was provided in the command
+                        channel = (unsigned char)cmdBuf[3]; // P2
+                    }
+                    if (channel > 0) {
+                        LOG(INFO, "Opened APDU channel %d", channel);
+                        if (autoClose) {
+                            apduChannel_ = channel;
+                            apduChannelTimer_.start(APDU_CHANNEL_TIMEOUT);
+                        }
+                    }
+                } else if (closeChannel) {
+                    int channel = (unsigned char)cmdBuf[3]; // P2
+                    LOG(INFO, "Closed APDU channel %d", channel);
+                    if (channel > 0 && channel == apduChannel_) {
+                        apduChannelTimer_.stop();
+                        apduChannel_ = 0;
+                    }
+                }
+            }
+        }
+    } else if (cmdChannel > 0 && cmdChannel == apduChannel_) {
+        apduChannelTimer_.start(APDU_CHANNEL_TIMEOUT); // Restart the inactivity timer
+    }
+
+    respSize = fromHex(respHex, respHexSize, respBuf, respSize);
+    return 0;
+}
+
+int QuectelNcpClient::closeApduChannel(int channel) {
+    // Don't use checkParser() here as this method is also called from initReady()
+    auto cmd = parser_.command();
+    cmd.print("AT+CSIM=10,\"007080"); // CLA, INS, P1
+
+    char hexBuf[3];
+    char c = channel;
+    toHex(&c, 1, hexBuf, sizeof(hexBuf));
+    cmd.print(hexBuf); // P2
+
+    cmd.print("00\""); // Le
+    CHECK_PARSER_OK(cmd.exec());
+    return 0;
+}
+
+void QuectelNcpClient::apduChannelTimeoutCb(void* arg) {
+    auto self = static_cast<QuectelNcpClient*>(arg);
+    NcpClientLock lock(self);
+
+    if (self->apduChannel_ <= 0) {
+        return;
+    }
+    int r = self->checkParser();
+    if (r < 0) {
+        return;
+    }
+
+    LOG(INFO, "Closing APDU channel %d due to timeout", self->apduChannel_);
+    r = self->closeApduChannel(self->apduChannel_);
+    if (r < 0) {
+        LOG(ERROR, "Error while closing APDU channel: %d", r);
+    }
+    self->apduChannel_ = 0;
 }
 
 void QuectelNcpClient::connectionState(NcpConnectionState state) {

@@ -23,12 +23,20 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 
 /* executes once at startup */
 void setup() {
+    // M-Hat requires this to enable USART communication to SBC
+    pinMode(A0, OUTPUT);
+    digitalWrite(A0, HIGH);
+
     // waitUntil(Serial.isConnected);
     // Enable Cellular
     Cellular.on();
     Cellular.connect();
     // Bind Tether interface to Serial1 @ 921600 baudrate with default settings (8n1 + RTS/CTS flow control)
     Tether.bind(TetherSerialConfig().baudrate(921600).serial(Serial1));
+
+    // Bind Tether to USB CDC interface
+    // Tether.bind(TetherUSBConfig());
+
     // Turn on Tether interface and bring it up
     Tether.on();
     Tether.connect();
