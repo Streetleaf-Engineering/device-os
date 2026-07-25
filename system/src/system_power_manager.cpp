@@ -26,6 +26,7 @@ LOG_SOURCE_CATEGORY("sys.power");
 #include "debug.h"
 #include "spark_wiring_platform.h"
 #include "pinmap_hal.h"
+#include "system_env.h"
 
 #if (HAL_PLATFORM_PMIC_BQ24195 && HAL_PLATFORM_FUELGAUGE_MAX17043)
 
@@ -43,6 +44,45 @@ LOG_SOURCE_CATEGORY("sys.power");
 using namespace particle::power;
 
 namespace {
+
+template <typename T>
+class EnsureWrapper {
+public:
+  EnsureWrapper(bool lock = true)
+      : base_(),
+        locked_(false) {
+    if (lock) {
+      locked_ = base_.lock();
+    }
+
+    // FIXME: would be nice if PMIC/FuelGauge provided i2c interface instance they are using
+    // themselves.
+    if (!hal_i2c_is_enabled(HAL_PLATFORM_PMIC_BQ24195_I2C, nullptr)) {
+      hal_i2c_begin(HAL_PLATFORM_PMIC_BQ24195_I2C, I2C_MODE_MASTER, 0x00, nullptr);
+      if (!hal_i2c_is_enabled(HAL_PLATFORM_PMIC_BQ24195_I2C, nullptr)) {
+        LOG(ERROR, "Failed to ensure pmic/fuelgauge i2c instance is enabled");
+      }
+    }
+  }
+
+  ~EnsureWrapper() {
+    if (locked_) {
+      base_.unlock();
+    }
+  }
+
+  T* operator->() {
+    return &base_;
+  }
+
+  const T* operator->() const {
+    return &base_;
+  }
+
+private:
+  T base_;
+  bool locked_;
+};
 
 constexpr uint8_t BQ24195_VERSION = 0x23;
 
@@ -70,6 +110,9 @@ constexpr uint16_t PMIC_FAULT_TERM_CHARGE_CURRENT = 128; // mA
 constexpr system_tick_t BATTERY_REPEATED_CHARGED_WINDOW = 5000; // ms
 constexpr uint8_t BATTERY_REPEATED_CHARGED_COUNT = 2;
 constexpr uint16_t AUX_PWR_EN_INPUT_CURRENT_THRESHOLD = 500; // mA
+constexpr uint16_t ENV_OVERRIDE_MAX_CURRENT = 1500; // mA
+constexpr uint16_t ENV_OVERRIDE_MIN_INPUT_CURRENT = 500; // mA, IINLIM step below the 900mA default
+constexpr uint16_t ENV_OVERRIDE_MIN_CHARGE_CURRENT = 512; // mA, BQ24195 ICHG base offset (hardware floor)
 
 constexpr hal_power_config defaultPowerConfig = {
   .flags = 0,
@@ -142,7 +185,7 @@ PowerManager* PowerManager::instance() {
 
 void PowerManager::enableAuxPwr() {
   if (!auxPwrEnabled_ && config_.version >= HAL_POWER_CONFIG_VERSION_1 && config_.aux_pwr_ctrl_pin != PIN_INVALID) {
-    LOG(INFO, "Enable auxiliary power");
+    LOG(INFO, "Enable aux power");
     hal_gpio_mode(config_.aux_pwr_ctrl_pin, OUTPUT);
     hal_gpio_write(config_.aux_pwr_ctrl_pin, config_.aux_pwr_ctrl_pin_level);
     auxPwrEnabled_ = true;
@@ -190,7 +233,7 @@ void PowerManager::init() {
 #endif // HAL_PLATFORM_POWER_MANAGEMENT_OPTIONAL
 
   if (config_.flags & HAL_POWER_MANAGEMENT_DISABLE) {
-    LOG(WARN, "Disabled by configuration");
+    LOG(WARN, "Disabled by config");
     // NOTE: We should at least apply the config in DCT in case of Safe mode.
     // Do not run DPDM, since the event loop will not be started.
     // User application should still call System.setPowerConfiguration() to set
@@ -218,18 +261,18 @@ void PowerManager::init() {
 
   hal_gpio_mode(pmicIntPin, INPUT_PULLUP);
   attachInterrupt(pmicIntPin, &PowerManager::isrHandler, FALLING);
-  PMIC power(true);
-  power.begin();
+  EnsureWrapper<PMIC> power;
+  power->begin();
   initDefault();
   // Clear old fault register state
-  power.getFault();
-  power.getFault();
-  FuelGauge fuel(true);
-  fuel.wakeup();
+  power->getFault();
+  power->getFault();
+  EnsureWrapper<FuelGauge> fuel;
+  fuel->wakeup();
   if ((config_.flags & HAL_POWER_CHARGE_STATE_DISABLE) == 0) {
-    fuel.setAlertThreshold(20); // Low Battery alert at 10% (about 3.6V)
+    fuel->setAlertThreshold(20); // Low Battery alert at 10% (about 3.6V)
   }
-  fuel.clearAlert(); // Ensure this is cleared, or interrupts will never occur
+  fuel->clearAlert(); // Ensure this is cleared, or interrupts will never occur
 
   os_thread_t th = nullptr;
   size_t stack_size = HAL_PLATFORM_POWER_MANAGEMENT_STACK_SIZE;
@@ -262,13 +305,15 @@ void PowerManager::sleep(bool fuelGaugeSleep) {
       initDefault(false);
     }
 #if HAL_PLATFORM_POWER_MANAGEMENT_PMIC_WATCHDOG
-    PMIC power;
-    // XXX:
-    power.disableWatchdog();
+    {
+      EnsureWrapper<PMIC> power;
+      // XXX:
+      power->disableWatchdog();
+    }
 #endif // HAL_PLATFORM_POWER_MANAGEMENT_PMIC_WATCHDOG
     if (fuelGaugeSleep && fuelGaugeAwake_) {
-      FuelGauge gauge;
-      gauge.sleep();
+      EnsureWrapper<FuelGauge> gauge;
+      gauge->sleep();
       fuelGaugeAwake_ = false;
     } else {
       fuelGaugeAwake_ = true;
@@ -288,14 +333,14 @@ void PowerManager::wakeup() {
 }
 
 void PowerManager::handleCharging(bool batteryDisconnected) {
-  PMIC power(true);
+  EnsureWrapper<PMIC> power;
 
   if ((config_.flags & HAL_POWER_CHARGE_STATE_DISABLE) || batteryDisconnected) {
-    if (power.isChargingEnabled()) {
+    if (power->isChargingEnabled()) {
       clearIntermediateBatteryState(STATE_ALL);
       DBG_PWR("Disabled charging.");
-      power.disableCharging();
-      power.disableSafetyTimer();
+      power->disableCharging();
+      power->disableSafetyTimer();
       disableChargingTimeStamp_ = millis();
       // Request to shorten the monitor period
       battMonitorPeriod_ = BATTERY_STATE_CHANGE_CHECK_PERIOD;
@@ -303,11 +348,11 @@ void PowerManager::handleCharging(bool batteryDisconnected) {
     return;
   }
 
-  if (!power.isChargingEnabled()) {
+  if (!power->isChargingEnabled()) {
     clearIntermediateBatteryState(STATE_ALL);
     DBG_PWR("Enable charging.");
-    power.enableCharging();
-    power.enableSafetyTimer();
+    power->enableCharging();
+    power->enableSafetyTimer();
     // Request to shorten the monitor period
     battMonitorPeriod_ = BATTERY_STATE_CHANGE_CHECK_PERIOD;
   }
@@ -320,17 +365,17 @@ void PowerManager::handleUpdate() {
 
   update_ = false;
 
-  PMIC power(true);
-  FuelGauge fuel(true);
+  EnsureWrapper<PMIC> power;
+  EnsureWrapper<FuelGauge> fuel;
 
   // In order to read the current fault status, the host has to read REG09 two times
   // consecutively. The 1st reads fault register status from the last read and the 2nd
   // reads the current fault register status.
-  volatile uint8_t lastFault = power.getFault();
-  const uint8_t curFault = power.getFault() | lastFault;
+  volatile uint8_t lastFault = power->getFault();
+  const uint8_t curFault = power->getFault() | lastFault;
 
   // Watchdog fault or buck converter got disabled
-  if ((curFault & 0x80 /*watchdog fault*/) || !power.isBuckEnabled()) {
+  if ((curFault & 0x80 /*watchdog fault*/) || !power->isBuckEnabled()) {
     // Restore parameters
     initDefault();
   } else {
@@ -338,13 +383,13 @@ void PowerManager::handleUpdate() {
     // handleCharging();
   }
 
-  const uint8_t status = power.getSystemStatus();
+  const uint8_t status = power->getSystemStatus();
   const uint8_t pwr_good = (status >> 2) & 0b01;
 
   // Deduce current battery state
   const uint8_t chrg_stat = (status >> 4) & 0b11;
   if (chrg_stat) {
-    if (power.isChargingEnabled()) {
+    if (power->isChargingEnabled()) {
       // Charging or charged
       if (chrg_stat == 0b11) {
         batteryStateTransitioningTo(BATTERY_STATE_CHARGED);
@@ -386,7 +431,7 @@ void PowerManager::handleUpdate() {
   // we also cannot modify input current limit while DPDM is running,
   // as that will cause a race condition and we might be left with 100mA
   // ILIM after it finishes.
-  if (pwr_good && !power.isInDPDM()) {
+  if (pwr_good && !power->isInDPDM()) {
     switch (powerSourceFromStatus(status)) {
       case POWER_SOURCE_USB_HOST: {
 #if HAL_PLATFORM_POWER_WORKAROUND_USB_HOST_VIN_SOURCE
@@ -432,9 +477,9 @@ void PowerManager::handleUpdate() {
     system_notify_event(power_source, (int)g_powerSource);
   }
 
-  const bool lowBat = fuel.getAlert();
+  const bool lowBat = fuel->getAlert();
   if (lowBat) {
-    fuel.clearAlert();
+    fuel->clearAlert();
     if (lowBatEnabled_) {
       lowBatEnabled_ = false;
       system_notify_event(low_battery);
@@ -443,7 +488,7 @@ void PowerManager::handleUpdate() {
 
   logStat(status, curFault);
 
-  if (power.getInputCurrentLimit() >= AUX_PWR_EN_INPUT_CURRENT_THRESHOLD) {
+  if (power->getInputCurrentLimit() >= AUX_PWR_EN_INPUT_CURRENT_THRESHOLD) {
     enableAuxPwr();
   }
 }
@@ -468,8 +513,8 @@ void PowerManager::loop(void* arg) {
       } else if (ev == Event::Wakeup) {
         self->initDefault();
         if (!self->fuelGaugeAwake_) {
-          FuelGauge fuel(true);
-          fuel.wakeup();
+          EnsureWrapper<FuelGauge> fuel;
+          fuel->wakeup();
           self->fuelGaugeAwake_ = true;
           HAL_Delay_Milliseconds(500);
         }
@@ -500,27 +545,27 @@ void PowerManager::isrHandlerEx(void* context) {
 #endif
 
 void PowerManager::initDefault(bool dpdm) {
-  PMIC power(true);
-  power.begin();
+  EnsureWrapper<PMIC> power;
+  power->begin();
 
 #if HAL_PLATFORM_POWER_MANAGEMENT_PMIC_WATCHDOG
   // We keep the watchdog running at 40s and make sure to kick it periodically
   // FIXME: Make sure to adjust PMIC_WATCHDOG_INTERVAL accordingly
-  power.resetWatchdog();
-  power.setWatchdog(0b01);
+  power->resetWatchdog();
+  power->setWatchdog(0b01);
 #else
   // Enters host-managed mode
-  power.disableWatchdog();
+  power->disableWatchdog();
 #endif // HAL_PLATFORM_POWER_MANAGEMENT_PMIC_WATCHDOG
 
   // Adjust charge voltage
-  power.setChargeVoltage(config_.termination_voltage);
+  power->setChargeVoltage(config_.termination_voltage);
 
   // Set recharge threshold to default value - 100mV
   DBG_PWR("initDefault, recharge threshold: %dmV, term current: %dmA", PMIC_NORMAL_RECHARGE_THRESHOLD, PMIC_NORMAL_TERM_CHARGE_CURRENT);
-  power.setRechargeThreshold(PMIC_NORMAL_RECHARGE_THRESHOLD);
-  power.setChargeCurrent(config_.charge_current);
-  power.setTermChargeCurrent(PMIC_NORMAL_TERM_CHARGE_CURRENT);
+  power->setRechargeThreshold(PMIC_NORMAL_RECHARGE_THRESHOLD);
+  power->setChargeCurrent(config_.charge_current);
+  power->setTermChargeCurrent(PMIC_NORMAL_TERM_CHARGE_CURRENT);
 
   // Enable or disable charging
   if (g_batteryState != BATTERY_STATE_UNKNOWN) {
@@ -530,14 +575,14 @@ void PowerManager::initDefault(bool dpdm) {
   }
 
   // Just in case make sure to enable BATFET
-  if (!power.isBATFETEnabled()) {
-    power.enableBATFET();
+  if (!power->isBATFETEnabled()) {
+    power->enableBATFET();
   }
 
   // Enable buck converter
-  bool inDpDm = power.isInDPDM();
-  if (!power.isBuckEnabled()) {
-    power.enableBuck();
+  bool inDpDm = power->isInDPDM();
+  if (!power->isBuckEnabled()) {
+    power->enableBuck();
     // Make sure we restart DPDM as otherwise we may get stuck
     // with an invalid ILIM due to reading back and writing
     // a transient value by modifying the same register with enableBuck()
@@ -546,8 +591,8 @@ void PowerManager::initDefault(bool dpdm) {
     }
   }
 
-  auto powerSource = powerSourceFromStatus(power.getSystemStatus());
-  bool vinWithValidLimit = (power.getInputCurrentLimit() > 100) &&
+  auto powerSource = powerSourceFromStatus(power->getSystemStatus());
+  bool vinWithValidLimit = (power->getInputCurrentLimit() > 100) &&
       ((powerSource == POWER_SOURCE_VIN) ||
       ((config_.flags & HAL_POWER_USE_VIN_SETTINGS_WITH_USB_HOST) && powerSource == POWER_SOURCE_USB_HOST));
 
@@ -558,15 +603,15 @@ void PowerManager::initDefault(bool dpdm) {
       // and we have a non-100mA limit set
       // NOTE: we have to wait for current one to finish
       auto start = HAL_Timer_Get_Milli_Seconds();
-      while (power.isInDPDM() && (HAL_Timer_Get_Milli_Seconds() - start < 1000)) {
+      while (power->isInDPDM() && (HAL_Timer_Get_Milli_Seconds() - start < 1000)) {
         HAL_Delay_Milliseconds(50);
       }
-      power.enableDPDM();
+      power->enableDPDM();
     }
   } else {
-    if (power.getInputCurrentLimit() != mapInputCurrentLimit(config_.vin_max_current)) {
-      power.setInputCurrentLimit(mapInputCurrentLimit(config_.vin_max_current));
-      if (power.getInputCurrentLimit() >= AUX_PWR_EN_INPUT_CURRENT_THRESHOLD) {
+    if (power->getInputCurrentLimit() != mapInputCurrentLimit(config_.vin_max_current)) {
+      power->setInputCurrentLimit(mapInputCurrentLimit(config_.vin_max_current));
+      if (power->getInputCurrentLimit() >= AUX_PWR_EN_INPUT_CURRENT_THRESHOLD) {
         enableAuxPwr();
       }
     }
@@ -597,8 +642,8 @@ void PowerManager::confirmBatteryState(battery_state_t from, battery_state_t to)
           DBG_PWR("Set term charge current: %dmA", PMIC_FAULT_TERM_CHARGE_CURRENT);
           // Now we probably attached a problematic battery, the term charge current
           // will persist until whenever the initDefault() is called.
-          PMIC power;
-          power.setTermChargeCurrent(PMIC_FAULT_TERM_CHARGE_CURRENT);
+          EnsureWrapper<PMIC> power;
+          power->setTermChargeCurrent(PMIC_FAULT_TERM_CHARGE_CURRENT);
           // The PMIC might change to charging state. Shorten the check period.
           battMonitorPeriod_ = BATTERY_STATE_CHANGE_CHECK_PERIOD;
         }
@@ -614,8 +659,8 @@ void PowerManager::confirmBatteryState(battery_state_t from, battery_state_t to)
   switch (from) {
     case BATTERY_STATE_DISCONNECTED: {
       // When going from DISCONNECTED state to any other state quick start fuel gauge
-      FuelGauge fuel;
-      fuel.quickStart();
+      EnsureWrapper<FuelGauge> fuel;
+      fuel->quickStart();
       // It will set the recharg threshold to 100mV
       initDefault();
       break;
@@ -640,8 +685,8 @@ void PowerManager::confirmBatteryState(battery_state_t from, battery_state_t to)
       repeatedChargedCount_ = 0;
       DBG_PWR("Term charge current: %dmA", PMIC_NORMAL_TERM_CHARGE_CURRENT);
       // Reset the termination charge current.
-      PMIC power;
-      power.setTermChargeCurrent(PMIC_NORMAL_TERM_CHARGE_CURRENT);
+      EnsureWrapper<PMIC> power;
+      power->setTermChargeCurrent(PMIC_NORMAL_TERM_CHARGE_CURRENT);
       break;
     }
     case BATTERY_STATE_DISCONNECTED:
@@ -683,8 +728,8 @@ void PowerManager::batteryStateTransitioningTo(battery_state_t targetState, bool
       battMonitorPeriod_ = BATTERY_STATE_CHANGE_CHECK_PERIOD;
       DBG_PWR("notChargingDebounceCount_: %d", notChargingDebounceCount_);
       if (notChargingDebounceCount_ >= BATTERY_NOT_CHARGING_DEBOUNCE_COUNT) {
-        PMIC power(true);
-        uint8_t status = power.getSystemStatus();
+        EnsureWrapper<PMIC> power;
+        uint8_t status = power->getSystemStatus();
         if (status & 0x01) {
             // In VSYSMIN regulation (BAT < VSYSMIN), it's probably disconnected
             confirmBatteryState(g_batteryState, BATTERY_STATE_DISCONNECTED);
@@ -730,8 +775,8 @@ void PowerManager::batteryStateTransitioningTo(battery_state_t targetState, bool
         chargedFaultCount_ = 0;
         
         DBG_PWR("Set fault recharge threshold: 300mV");
-        PMIC power(true);
-        power.setRechargeThreshold(PMIC_FAULT_RECHARGE_THRESHOLD); // 300mV
+        EnsureWrapper<PMIC> power;
+        power->setRechargeThreshold(PMIC_FAULT_RECHARGE_THRESHOLD); // 300mV
       }
     }
   }
@@ -764,8 +809,8 @@ void PowerManager::deduceBatteryStateLoop() {
 
   // This should be executed only when charging is enabled and we got a charged event
   if (lastChargedTimeStamp_ != 0 && (millis() - lastChargedTimeStamp_) >= BATTERY_CHARGED_MUTE_WINDOW) {
-    PMIC power(true);
-    if ((config_.flags & HAL_POWER_CHARGE_STATE_DISABLE) || !power.isChargingEnabled()) {
+    EnsureWrapper<PMIC> power;
+    if ((config_.flags & HAL_POWER_CHARGE_STATE_DISABLE) || !power->isChargingEnabled()) {
       DBG_PWR("Fault state, re-enable/disable charging!");
       // If charging is disabled as per the configuration, we shouldn't get here
       clearIntermediateBatteryState(STATE_ALL);
@@ -779,7 +824,7 @@ void PowerManager::deduceBatteryStateLoop() {
       if (possibleChargedFault) {
         // Restore normal recharge threshold
         DBG_PWR("Restore normal threshold: 100mV");
-        power.setRechargeThreshold(PMIC_NORMAL_RECHARGE_THRESHOLD); // 100mV
+        power->setRechargeThreshold(PMIC_NORMAL_RECHARGE_THRESHOLD); // 100mV
       }
     }
     return;
@@ -803,8 +848,8 @@ void PowerManager::deduceBatteryStateChargeDisabled() {
   // is based on the experience that when charging is disabled, the VCELL can
   // correctly be measured.
   // When charging is disabled, the VCELL can reliably reflect the voltage on VBAT
-  FuelGauge fuel(true);
-  float vCell = fuel.getVCell();
+  EnsureWrapper<FuelGauge> fuel;
+  float vCell = fuel->getVCell();
   DBG_PWR("VCell: %dmV", (uint16_t)(vCell * 1000));
 
   // Make an assumption
@@ -834,8 +879,8 @@ void PowerManager::deduceBatteryStateChargeDisabled() {
   }
 
 connected:
-  PMIC power(true);
-  const uint8_t status = power.getSystemStatus();
+  EnsureWrapper<PMIC> power;
+  const uint8_t status = power->getSystemStatus();
   const uint8_t pwrGood = (status >> 2) & 0b01;
   if (!pwrGood) {
     DBG_PWR("Power is not good");
@@ -852,15 +897,15 @@ connected:
 
 void PowerManager::deduceBatteryStateChargeEnabled() {
   DBG_PWR("deduceBatteryStateChargeEnabled()");
-  PMIC power(true);
+  EnsureWrapper<PMIC> power;
 
-  if (g_batteryState == BATTERY_STATE_DISCONNECTED && !power.isChargingEnabled() /* MUST not enabled */) {
+  if (g_batteryState == BATTERY_STATE_DISCONNECTED && !power->isChargingEnabled() /* MUST not enabled */) {
     if (millis() - disableChargingTimeStamp_ < BATTERY_DISABLE_CHARGING_SUPRESS_PERIOD) {
       return;
     }
     // At this point, we are still disabling charging, the VCELL can reliably reflect the voltage on VBAT
-    FuelGauge fuel(true);
-    float vCell = fuel.getVCell();
+    EnsureWrapper<FuelGauge> fuel;
+    float vCell = fuel->getVCell();
     DBG_PWR("VCell: %dmV", (uint16_t)(vCell * 1000));
     if (vCell < BATTERY_CONNECTED_VCELL_THRESHOLD) {
       DBG_PWR("It's still disconnected.");
@@ -873,7 +918,7 @@ void PowerManager::deduceBatteryStateChargeEnabled() {
 
   handleCharging(false); // If we reach here, we assume that the battery is connected and charging should be enabled
 
-  const uint8_t status = power.getSystemStatus();
+  const uint8_t status = power->getSystemStatus();
   const uint8_t chargeState = (status >> 4) & 0b11;
   if (chargeState == 0b11 && g_batteryState != BATTERY_STATE_CHARGED) {
     batteryStateTransitioningTo(BATTERY_STATE_CHARGED);
@@ -897,8 +942,8 @@ void PowerManager::checkWatchdog() {
 #if HAL_PLATFORM_POWER_MANAGEMENT_PMIC_WATCHDOG
   if (millis() - pmicWatchdogTimer_ >= (PMIC_WATCHDOG_INTERVAL / 2)) {
     pmicWatchdogTimer_ = millis();
-    PMIC power;
-    power.resetWatchdog();
+    EnsureWrapper<PMIC> power;
+    power->resetWatchdog();
   }
 #endif // HAL_PLATFORM_POWER_MANAGEMENT_PMIC_WATCHDOG
 }
@@ -925,16 +970,16 @@ void PowerManager::logStat(uint8_t stat, uint8_t fault) {
 bool PowerManager::detect() {
   // Check if runtime detection enabled
   if (!(config_.flags & HAL_POWER_PMIC_DETECTION)) {
-    LOG(INFO, "Runtime PMIC/FuelGauge detection is not enabled");
+    LOG(INFO, "PMIC/FuelGauge detection disabled");
     return false;
   }
 
   resetBus();
 
   // Check that PMIC is present by reading its version
-  PMIC power(true);
-  power.begin();
-  auto pVer = power.getVersion();
+  EnsureWrapper<PMIC> power;
+  power->begin();
+  auto pVer = power->getVersion();
   if (pVer != BQ24195_VERSION) {
     LOG(WARN, "PMIC not present");
     return false;
@@ -942,14 +987,14 @@ bool PowerManager::detect() {
   LOG_DEBUG(INFO, "PMIC present, version %02x", (int)pVer);
 
   // Check that FuelGauge is present by reading its version
-  FuelGauge fuel(true);
-  fuel.wakeup();
-  auto fVer = fuel.getVersion();
+  EnsureWrapper<FuelGauge> fuel;
+  fuel->wakeup();
+  auto fVer = fuel->getVersion();
   if (fVer == 0x0000 || fVer == 0xffff) {
     LOG(WARN, "FuelGauge not present");
     return false;
   }
-  fuel.clearAlert();
+  fuel->clearAlert();
   LOG_DEBUG(INFO, "FuelGauge present, version %04x", (int)fVer);
 
   // FIXME: there is no reliable way to check whether PMIC interrupt line
@@ -964,15 +1009,19 @@ bool PowerManager::detect() {
 void PowerManager::resetBus() {
   if (!hal_i2c_is_enabled(HAL_PLATFORM_PMIC_BQ24195_I2C, nullptr)) {
     hal_i2c_init(HAL_PLATFORM_PMIC_BQ24195_I2C, nullptr);
-    hal_i2c_begin(HAL_PLATFORM_PMIC_BQ24195_I2C, I2C_MODE_MASTER, 0x00, nullptr);
-    // Make sure to reset the I2C bus to avoid potentially corrupting the BQ24195 configuration if
-    // we start communication with it during an ongoing write transaction (which may happen e.g. after a hard reset)
-    hal_i2c_reset(HAL_PLATFORM_PMIC_BQ24195_I2C, 0, nullptr);
+    {
+      hal_i2c_lock(HAL_PLATFORM_PMIC_BQ24195_I2C, nullptr);
+      hal_i2c_begin(HAL_PLATFORM_PMIC_BQ24195_I2C, I2C_MODE_MASTER, 0x00, nullptr);
+      // Make sure to reset the I2C bus to avoid potentially corrupting the BQ24195 configuration if
+      // we start communication with it during an ongoing write transaction (which may happen e.g. after a hard reset)
+      hal_i2c_reset(HAL_PLATFORM_PMIC_BQ24195_I2C, 0, nullptr);
+      hal_i2c_unlock(HAL_PLATFORM_PMIC_BQ24195_I2C, nullptr);
+    }
   }
 }
 
 void PowerManager::deinit() {
-  LOG(WARN, "Disabling system power manager");
+  LOG(WARN, "Disabling power manager");
 #if HAL_PLATFORM_POWER_MANAGEMENT_OPTIONAL
   if (detect_) {
 #else
@@ -981,8 +1030,8 @@ void PowerManager::deinit() {
 #endif // #if HAL_PLATFORM_POWER_MANAGEMENT_OPTIONAL
     // Return it to automatic mode if power management was not explicitly disabled
     if (!(config_.flags & HAL_POWER_MANAGEMENT_DISABLE)) {
-      PMIC power(true);
-      power.setWatchdog(0b01);
+      EnsureWrapper<PMIC> power;
+      power->setWatchdog(0b01);
     }
   }
 
@@ -1069,17 +1118,33 @@ void PowerManager::loadConfig() {
   int err = getConfig(&config_);
   (void)err;
 
+#if HAL_PLATFORM_ENV
+  // Power env vars override any user firmware or default settings.
+  // Values are bounded to practical limits for each parameter and are mapped to
+  // the supported PMIC register values when applied. If the charge current exceeds
+  // the input current limit, the PMIC's VINDPM loop will throttle charging.
+  int value = 0;
+  if (!system_get_env_int("PARTICLE_PMIC_INPUT_CURRENT", &value, nullptr) &&
+      value >= ENV_OVERRIDE_MIN_INPUT_CURRENT && value <= ENV_OVERRIDE_MAX_CURRENT) {
+    config_.vin_max_current = (uint16_t)value;
+  }
+  if (!system_get_env_int("PARTICLE_PMIC_CHARGE_CURRENT", &value, nullptr) &&
+      value >= ENV_OVERRIDE_MIN_CHARGE_CURRENT && value <= ENV_OVERRIDE_MAX_CURRENT) {
+    config_.charge_current = (uint16_t)value;
+  }
+#endif // HAL_PLATFORM_ENV
+
   logCurrentConfig();
 }
 
 void PowerManager::applyVinConfig() {
-  PMIC power;
-  if (power.getInputCurrentLimit() != mapInputCurrentLimit(config_.vin_max_current)) {
-    power.setInputCurrentLimit(mapInputCurrentLimit(config_.vin_max_current));
+  EnsureWrapper<PMIC> power;
+  if (power->getInputCurrentLimit() != mapInputCurrentLimit(config_.vin_max_current)) {
+    power->setInputCurrentLimit(mapInputCurrentLimit(config_.vin_max_current));
   }
 
-  if (power.getInputVoltageLimit() != mapInputVoltageLimit(config_.vin_min_voltage)) {
-    power.setInputVoltageLimit(mapInputVoltageLimit(config_.vin_min_voltage));
+  if (power->getInputVoltageLimit() != mapInputVoltageLimit(config_.vin_min_voltage)) {
+    power->setInputVoltageLimit(mapInputVoltageLimit(config_.vin_min_voltage));
   }
 }
 
@@ -1094,14 +1159,14 @@ void PowerManager::logCurrentConfig() {
 }
 
 void PowerManager::applyDefaultConfig(bool dpdm) {
-  PMIC power;
-  if (power.getInputVoltageLimit() != DEFAULT_INPUT_VOLTAGE_LIMIT) {
-    power.setInputVoltageLimit(DEFAULT_INPUT_VOLTAGE_LIMIT);
+  EnsureWrapper<PMIC> power;
+  if (power->getInputVoltageLimit() != DEFAULT_INPUT_VOLTAGE_LIMIT) {
+    power->setInputVoltageLimit(DEFAULT_INPUT_VOLTAGE_LIMIT);
   }
   if (dpdm) {
     // Force-start input current limit detection
     LOG_DEBUG(TRACE, "Re-running DPDM");
-    power.enableDPDM();
+    power->enableDPDM();
   }
 }
 

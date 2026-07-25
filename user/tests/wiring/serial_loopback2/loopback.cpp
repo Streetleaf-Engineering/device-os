@@ -19,6 +19,8 @@
 #include "unit-test/unit-test.h"
 #include "random.h"
 
+#define USE_SERIAL Serial1
+
 /* WIRING
  *                       74xx125
  *          10k          ___ ____
@@ -36,7 +38,7 @@
 #warning "Using default 64 byte buffer"
 #define USE_BUFFER_SIZE (SERIAL_BUFFER_SIZE)
 #else
-hal_usart_buffer_config_t acquireSerial1Buffer()
+hal_usart_buffer_config_t acquire ## USE_SERIAL ## Buffer ()
 {
 #if !HAL_PLATFORM_USART_9BIT_SUPPORTED
     const size_t bufferSize = USE_BUFFER_SIZE;
@@ -69,28 +71,28 @@ void runLoopback(size_t buffer_size_min, size_t buffer_size_max, bool sleep, boo
         if (ninebit) {
             c |= 0b100000000;
         }
-        Serial1.write(c);
+        USE_SERIAL.write(c);
     }
-    Serial1.flush();
+    USE_SERIAL.flush();
 
     if (sleep) {
-        int ret = hal_usart_sleep(HAL_USART_SERIAL1, true, nullptr);
+        int ret = hal_usart_sleep(USE_SERIAL.interface(), true, nullptr);
         assertEqual(ret, (int)SYSTEM_ERROR_NONE);
-        assertFalse(Serial1.isEnabled());
+        assertFalse(USE_SERIAL.isEnabled());
 
-        ret = hal_usart_sleep(HAL_USART_SERIAL1, false, nullptr);
+        ret = hal_usart_sleep(USE_SERIAL.interface(), false, nullptr);
         assertEqual(ret, (int)SYSTEM_ERROR_NONE);
-        assertTrue(Serial1.isEnabled());
+        assertTrue(USE_SERIAL.isEnabled());
     }
 
     size_t pos = 0;
     char rxBuf[bufferSize] = {};
     do {
         size_t available = bufferSize - pos;
-        size_t serial1Available = Serial1.available();
-        assertEqual(available, serial1Available);
+        size_t serialAvailable = USE_SERIAL.available();
+        assertEqual(available, serialAvailable);
         if (available) {
-            uint16_t c = Serial1.read();
+            uint16_t c = USE_SERIAL.read();
             if (ninebit) {
                 assertTrue(c & 0b100000000);
             } else {
@@ -100,6 +102,41 @@ void runLoopback(size_t buffer_size_min, size_t buffer_size_max, bool sleep, boo
         }
     } while (++pos <= bufferSize);
 
+    assertTrue(!strncmp(txBuf, rxBuf, bufferSize));
+}
+
+void runLoopbackMultiByte(size_t buffer_size_min, size_t buffer_size_max) {
+    particle::Random rand;
+
+    size_t bufferSize = random(buffer_size_min, buffer_size_max);
+    char txBuf[bufferSize] = {};
+    rand.genBase32(txBuf, bufferSize);
+
+    USE_SERIAL.write((const uint8_t*)txBuf, bufferSize);
+    USE_SERIAL.flush();
+
+    char rxBuf[bufferSize] = {};
+    USE_SERIAL.setTimeout(1000);
+    size_t read = USE_SERIAL.readBytes(rxBuf, bufferSize);
+    assertEqual(read, bufferSize);
+    assertTrue(!strncmp(txBuf, rxBuf, bufferSize));
+
+    char peekBuf[bufferSize] = {};
+    // Refill for peek test
+    USE_SERIAL.write((const uint8_t*)txBuf, bufferSize);
+    USE_SERIAL.flush();
+    // Wait for data to arrive
+    while (USE_SERIAL.available() < (int)bufferSize) {
+        delay(1);
+    }
+    int peeked = USE_SERIAL.peek(peekBuf, bufferSize);
+    assertEqual(peeked, (int)bufferSize);
+    assertTrue(!strncmp(txBuf, peekBuf, bufferSize));
+    // peek must not consume
+    assertEqual(USE_SERIAL.available(), (int)bufferSize);
+    // drain
+    size_t drained = USE_SERIAL.readBytes(rxBuf, bufferSize);
+    assertEqual(drained, bufferSize);
     assertTrue(!strncmp(txBuf, rxBuf, bufferSize));
 }
 
@@ -114,11 +151,31 @@ test(SERIAL_00_LoopbackNoDataLossAndAvailableIsCorrect) {
     const unsigned ITERATIONS = 10000;
     const unsigned BAUD_RATE = 115200;
 
-    Serial1.end();
-    Serial1.begin(BAUD_RATE);
+    USE_SERIAL.end();
+    USE_SERIAL.begin(BAUD_RATE);
 
     for (unsigned i = 0; i < ITERATIONS; ++i) {
         runLoopback(TEST_BUFFER_SIZE_MIN, TEST_BUFFER_SIZE_MAX, false);
+        if (this->state == DONE_FAIL) {
+            break;
+        }
+    }
+}
+
+test(SERIAL_00b_LoopbackMultiByteNoDataLoss) {
+    const size_t TEST_BUFFER_SIZE_MIN = 8;
+    const size_t TEST_BUFFER_SIZE_MAX = USE_BUFFER_SIZE / 2;
+    const unsigned ITERATIONS = 1000;
+    const unsigned BAUD_RATE = 115200;
+
+    USE_SERIAL.end();
+    USE_SERIAL.begin(BAUD_RATE);
+
+    for (unsigned i = 0; i < ITERATIONS; ++i) {
+        runLoopbackMultiByte(TEST_BUFFER_SIZE_MIN, TEST_BUFFER_SIZE_MAX);
+        if (this->state == DONE_FAIL) {
+            break;
+        }
     }
 }
 
@@ -128,19 +185,22 @@ test(SERIAL_01_LoopbackSleepWakeupShouldSucceed) {
     constexpr unsigned ITERATIONS = 10000;
     constexpr unsigned BAUD_RATE = 115200;
 
-    Serial1.end();
-    Serial1.begin(BAUD_RATE);
+    USE_SERIAL.end();
+    USE_SERIAL.begin(BAUD_RATE);
 
-    int ret = hal_usart_sleep(HAL_USART_SERIAL1, true, nullptr);
+    int ret = hal_usart_sleep(USE_SERIAL.interface(), true, nullptr);
     assertEqual(ret, (int)SYSTEM_ERROR_NONE);
-    assertFalse(Serial1.isEnabled());
+    assertFalse(USE_SERIAL.isEnabled());
 
-    ret = hal_usart_sleep(HAL_USART_SERIAL1, false, nullptr);
+    ret = hal_usart_sleep(USE_SERIAL.interface(), false, nullptr);
     assertEqual(ret, (int)SYSTEM_ERROR_NONE);
-    assertTrue(Serial1.isEnabled());
+    assertTrue(USE_SERIAL.isEnabled());
 
     for (unsigned i = 0; i < ITERATIONS; ++i) {
         runLoopback(TEST_BUFFER_SIZE_MIN, TEST_BUFFER_SIZE_MAX, false);
+        if (this->state == DONE_FAIL) {
+            break;
+        }
     }
 }
 
@@ -150,26 +210,33 @@ test(SERIAL_02_LoopbackReceivedDataShouldRetainAfterSleepWakeup) {
     constexpr unsigned ITERATIONS = 10000;
     constexpr unsigned BAUD_RATE = 115200;
 
-    Serial1.end();
-    Serial1.begin(BAUD_RATE);
+    USE_SERIAL.end();
+    USE_SERIAL.begin(BAUD_RATE);
 
     for (unsigned i = 0; i < ITERATIONS; ++i) {
         runLoopback(TEST_BUFFER_SIZE_MIN, TEST_BUFFER_SIZE_MAX, true);
+        if (this->state == DONE_FAIL) {
+            break;
+        }
     }
 }
 
 #if HAL_PLATFORM_USART_9BIT_SUPPORTED
+
 test(SERIAL_03_Loopback9BitNoDataLossAndAvailableIsCorrect) {
     const size_t TEST_BUFFER_SIZE_MIN = 8;
     const size_t TEST_BUFFER_SIZE_MAX = USE_BUFFER_SIZE / 2;
     const unsigned ITERATIONS = 10000;
     const unsigned BAUD_RATE = 115200;
 
-    Serial1.end();
-    Serial1.begin(BAUD_RATE, SERIAL_9N1);
+    USE_SERIAL.end();
+    USE_SERIAL.begin(BAUD_RATE, SERIAL_9N1);
 
     for (unsigned i = 0; i < ITERATIONS; ++i) {
         runLoopback(TEST_BUFFER_SIZE_MIN, TEST_BUFFER_SIZE_MAX, false);
+        if (this->state == DONE_FAIL) {
+            break;
+        }
     }
 }
 
@@ -179,19 +246,22 @@ test(SERIAL_04_Loopback9BitSleepWakeupShouldSucceed) {
     constexpr unsigned ITERATIONS = 10000;
     constexpr unsigned BAUD_RATE = 115200;
 
-    Serial1.end();
-    Serial1.begin(BAUD_RATE, SERIAL_9N1);
+    USE_SERIAL.end();
+    USE_SERIAL.begin(BAUD_RATE, SERIAL_9N1);
 
-    int ret = hal_usart_sleep(HAL_USART_SERIAL1, true, nullptr);
+    int ret = hal_usart_sleep(USE_SERIAL.interface(), true, nullptr);
     assertEqual(ret, (int)SYSTEM_ERROR_NONE);
-    assertFalse(Serial1.isEnabled());
+    assertFalse(USE_SERIAL.isEnabled());
 
-    ret = hal_usart_sleep(HAL_USART_SERIAL1, false, nullptr);
+    ret = hal_usart_sleep(USE_SERIAL.interface(), false, nullptr);
     assertEqual(ret, (int)SYSTEM_ERROR_NONE);
-    assertTrue(Serial1.isEnabled());
+    assertTrue(USE_SERIAL.isEnabled());
 
     for (unsigned i = 0; i < ITERATIONS; ++i) {
         runLoopback(TEST_BUFFER_SIZE_MIN, TEST_BUFFER_SIZE_MAX, false);
+        if (this->state == DONE_FAIL) {
+            break;
+        }
     }
 }
 
@@ -201,16 +271,19 @@ test(SERIAL_05_Loopback9BitReceivedDataShouldRetainAfterSleepWakeup) {
     constexpr unsigned ITERATIONS = 10000;
     constexpr unsigned BAUD_RATE = 115200;
 
-    Serial1.end();
-    Serial1.begin(BAUD_RATE, SERIAL_9N1);
+    USE_SERIAL.end();
+    USE_SERIAL.begin(BAUD_RATE, SERIAL_9N1);
 
     for (unsigned i = 0; i < ITERATIONS; ++i) {
         runLoopback(TEST_BUFFER_SIZE_MIN, TEST_BUFFER_SIZE_MAX, true);
+        if (this->state == DONE_FAIL) {
+            break;
+        }
     }
 }
+
+#endif // HAL_PLATFORM_USART_9BIT_SUPPORTED
 
 test(SERIAL_ZZZ_Cleanup) {
     pinMode(A2, INPUT); // PULL-UP HIGH
 }
-
-#endif // HAL_PLATFORM_USART_9BIT_SUPPORTED

@@ -28,6 +28,11 @@
 
 namespace {
 
+static const int WIFI_KEEPALIVE_SECONDS = 30;
+static const int ETHERNET_KEEPALIVE_SECONDS = 40;
+static const int DEFAULT_KEEPALIVE_SECONDS = 50;
+static const int PLATFORM_DEFAULT_KEEPALIVE_SECONDS = HAL_PLATFORM_DEFAULT_CLOUD_KEEPALIVE_INTERVAL / 1000;
+
 #if HAL_PLATFORM_ETHERNET
 
 retained bool skipEthernet = false;
@@ -257,8 +262,40 @@ test(04_particle_ble_enable_false) {
 
 #endif // HAL_PLATFORM_BLE
 
+test(05_particle_default_cloud_keepalive) {
+    System.disableUpdates();
+    SCOPE_GUARD({
+        Particle.disconnect();
+        waitForNot(Particle.connected, 1000);
+        System.enableUpdates();
+    });
+
+    assertTrue(System.hasEnv("PARTICLE_CLOUD_KEEP_ALIVE"));
+    int keepAlive = 0;
+    assertTrue(System.getEnv("PARTICLE_CLOUD_KEEP_ALIVE", keepAlive));
+    assertEqual(keepAlive, DEFAULT_KEEPALIVE_SECONDS);
+
+    Network.on();
+    Network.connect();
+    Particle.connect();
+
+    assertTrue(waitFor(Particle.connected, HAL_PLATFORM_MAX_CLOUD_CONNECT_TIME));
+    assertEqual(Particle.getKeepAlive(), DEFAULT_KEEPALIVE_SECONDS);
+
+    Particle.keepAlive(120s);
+    Particle.disconnect();
+    waitForNot(Particle.connected, 60000);
+    Network.disconnect();
+    waitForNot(Network.ready, 60000);
+
+    Network.connect();
+    Particle.connect();
+    assertTrue(waitFor(Particle.connected, HAL_PLATFORM_MAX_CLOUD_CONNECT_TIME));
+    assertEqual(Particle.getKeepAlive(), 120);
+}
+
 #if HAL_PLATFORM_WIFI && !HAL_PLATFORM_WIFI_SCAN_ONLY
-test(05_particle_wifi_enable_init) {
+test(06_particle_wifi_enable_init) {
     System.disableFeature(FEATURE_DISABLE_LISTENING_MODE);
     System.enableFeature(FEATURE_ETHERNET_DETECTION);
 #if HAL_PLATFORM_HW_FORM_FACTOR_SOM
@@ -271,7 +308,7 @@ test(05_particle_wifi_enable_init) {
     System.reset();
 }
 
-test(06_particle_wifi_enable_default) {
+test(07_particle_wifi_enable_default) {
     auto vars = System.listEnv();
     assertEqual(vars.size(), 0);
 
@@ -292,6 +329,7 @@ test(06_particle_wifi_enable_default) {
     Particle.connect();
     assertTrue(waitFor(WiFi.ready, HAL_PLATFORM_MAX_CLOUD_CONNECT_TIME));
     assertTrue(waitFor(Particle.connected, HAL_PLATFORM_MAX_CLOUD_CONNECT_TIME));
+    assertEqual(Particle.getKeepAlive(), PLATFORM_DEFAULT_KEEPALIVE_SECONDS);
 
 #if HAL_PLATFORM_BLE
     // BLE is not affected
@@ -306,9 +344,14 @@ test(06_particle_wifi_enable_default) {
 #endif // HAL_PLATFORM_BLE
 }
 
-test(07_particle_wifi_enable_true) {
+test(08_particle_wifi_enable_true) {
     assertTrue(System.hasEnv("PARTICLE_WIFI_ENABLE"));
     assertEqual(System.getEnv("PARTICLE_WIFI_ENABLE"), String("true"));
+
+    assertTrue(System.hasEnv("PARTICLE_WIFI_CLOUD_KEEP_ALIVE"));
+    int keepAlive = 0;
+    assertTrue(System.getEnv("PARTICLE_WIFI_CLOUD_KEEP_ALIVE", keepAlive));
+    assertEqual(keepAlive, WIFI_KEEPALIVE_SECONDS);
 
     assertEqual((int)TestSuite::instance()->network(), (int)NETWORK_INTERFACE_WIFI_STA);
 
@@ -326,6 +369,12 @@ test(07_particle_wifi_enable_true) {
     assertTrue(waitFor(WiFi.ready, HAL_PLATFORM_MAX_CLOUD_CONNECT_TIME));
     assertTrue(waitFor(Particle.connected, HAL_PLATFORM_MAX_CLOUD_CONNECT_TIME));
 
+    assertEqual(Particle.getKeepAlive(), WIFI_KEEPALIVE_SECONDS);
+    assertEqual(Particle.getKeepAlive(WiFi), WIFI_KEEPALIVE_SECONDS);
+#if HAL_PLATFORM_CELLULAR
+    assertEqual(Particle.getKeepAlive(Cellular), DEFAULT_KEEPALIVE_SECONDS);
+#endif
+
 #if HAL_PLATFORM_BLE
     // BLE is not affected
     assertMore(validateBleScan(), 0);
@@ -339,7 +388,7 @@ test(07_particle_wifi_enable_true) {
 #endif // HAL_PLATFORM_BLE
 }
 
-test(08_particle_wifi_enable_false) {
+test(09_particle_wifi_enable_false) {
     assertTrue(System.hasEnv("PARTICLE_WIFI_ENABLE"));
     assertEqual(System.getEnv("PARTICLE_WIFI_ENABLE"), String("false"));
 
@@ -372,7 +421,7 @@ test(08_particle_wifi_enable_false) {
 #endif // HAL_PLATFORM_BLE
 }
 
-test(09_particle_wifi_enable_false_connect_through_other_ifaces) {
+test(10_particle_wifi_enable_false_connect_through_other_ifaces) {
     bool shouldConnect = false;
 #if HAL_PLATFORM_CELLULAR
     shouldConnect = TestSuite::instance()->network() == NETWORK_INTERFACE_CELLULAR || TestSuite::instance()->network() == NETWORK_INTERFACE_ALL;
@@ -421,7 +470,7 @@ test(09_particle_wifi_enable_false_connect_through_other_ifaces) {
 #endif // HAL_PLATFORM_BLE
 }
 
-test(10_particle_wifi_enable_cleanup) {
+test(11_particle_wifi_enable_cleanup) {
 #if HAL_PLATFORM_ETHERNET
     System.disableFeature(FEATURE_ETHERNET_DETECTION);
 #if HAL_PLATFORM_HW_FORM_FACTOR_SOM
@@ -436,7 +485,7 @@ test(10_particle_wifi_enable_cleanup) {
 #endif // HAL_PLATFORM_WIFI && !HAL_PLATFORM_WIFI_SCAN_ONLY
 
 #if HAL_PLATFORM_ETHERNET
-test(11_particle_ethernet_enable_init) {
+test(12_particle_ethernet_enable_init) {
     System.disableFeature(FEATURE_DISABLE_LISTENING_MODE);
     System.enableFeature(FEATURE_ETHERNET_DETECTION);
 #if HAL_PLATFORM_HW_FORM_FACTOR_SOM
@@ -450,7 +499,7 @@ test(11_particle_ethernet_enable_init) {
     System.reset();
 }
 
-test(12_particle_ethernet_enable_default) {
+test(13_particle_ethernet_enable_default) {
     if (!isEthernetPresent()) {
         skipEthernet = true;
         skip();
@@ -478,13 +527,18 @@ test(12_particle_ethernet_enable_default) {
     assertTrue(waitFor(Particle.connected, HAL_PLATFORM_MAX_CLOUD_CONNECT_TIME));
 }
 
-test(13_particle_ethernet_enable_true) {
+test(14_particle_ethernet_enable_true) {
     if (skipEthernet) {
         skip();
         return;
     }
     assertTrue(System.hasEnv("PARTICLE_ETHERNET_ENABLE"));
     assertEqual(System.getEnv("PARTICLE_ETHERNET_ENABLE"), String("true"));
+
+    assertTrue(System.hasEnv("PARTICLE_ETHERNET_CLOUD_KEEP_ALIVE"));
+    int keepAlive = 0;
+    assertTrue(System.getEnv("PARTICLE_ETHERNET_CLOUD_KEEP_ALIVE", keepAlive));
+    assertEqual(keepAlive, ETHERNET_KEEPALIVE_SECONDS);
 
     assertEqual((int)TestSuite::instance()->network(), (int)NETWORK_INTERFACE_ETHERNET);
 
@@ -501,9 +555,12 @@ test(13_particle_ethernet_enable_true) {
     Particle.connect();
     assertTrue(waitFor(Ethernet.ready, HAL_PLATFORM_MAX_CLOUD_CONNECT_TIME));
     assertTrue(waitFor(Particle.connected, HAL_PLATFORM_MAX_CLOUD_CONNECT_TIME));
+
+    assertEqual(Particle.getKeepAlive(), ETHERNET_KEEPALIVE_SECONDS);
+    assertEqual(Particle.getKeepAlive(Ethernet), ETHERNET_KEEPALIVE_SECONDS);
 }
 
-test(14_particle_ethernet_enable_false) {
+test(15_particle_ethernet_enable_false) {
     if (skipEthernet) {
         skip();
         return;
@@ -516,7 +573,7 @@ test(14_particle_ethernet_enable_false) {
     assertFalse(isEthernetPresent());
 }
 
-test(15_particle_ethernet_enable_false_connect_through_other_ifaces) {
+test(16_particle_ethernet_enable_false_connect_through_other_ifaces) {
     if (skipEthernet) {
         skip();
         return;
@@ -544,7 +601,7 @@ test(15_particle_ethernet_enable_false_connect_through_other_ifaces) {
     assertTrue(waitFor(Particle.connected, HAL_PLATFORM_MAX_CLOUD_CONNECT_TIME));
 }
 
-test(16_particle_ethernet_enable_cleanup) {
+test(17_particle_ethernet_enable_cleanup) {
     System.disableFeature(FEATURE_ETHERNET_DETECTION);
 #if HAL_PLATFORM_HW_FORM_FACTOR_SOM
     if (particle::test::detectMuonBoard()) {
@@ -555,6 +612,186 @@ test(16_particle_ethernet_enable_cleanup) {
     System.reset();
 }
 #endif // HAL_PLATFORM_ETHERNET
+
+#if HAL_PLATFORM_POWER_MANAGEMENT && HAL_PLATFORM_PMIC_BQ24195 && HAL_PLATFORM_FUELGAUGE_MAX17043
+#define POWER_ENV_TESTS 1
+#include "system_power.h"
+#else
+#define POWER_ENV_TESTS 0
+#endif
+
+#if POWER_ENV_TESTS
+
+namespace {
+
+// Default power configuration values as applied to the PMIC
+const uint16_t DEFAULT_PMIC_INPUT_CURRENT_LIMIT = particle::power::DEFAULT_INPUT_CURRENT_LIMIT;
+const uint16_t DEFAULT_PMIC_CHARGE_CURRENT = particle::power::DEFAULT_CHARGE_CURRENT;
+
+// Env var override values (see env.spec.js)
+const uint16_t POWER_ENV_INPUT_CURRENT_LIMIT = 1200; // mA
+const uint16_t POWER_ENV_CHARGE_CURRENT = 1024; // mA
+// 1408mA exceeds the 1200mA input current limit and is applied as requested (it falls
+// exactly on the 64mA ICHG grid); the PMIC's VINDPM loop throttles charging at runtime
+const uint16_t POWER_ENV_EXCESSIVE_CHARGE_CURRENT = 1408; // mA
+
+constexpr uint8_t BQ24195_VERSION = 0x23;
+
+retained bool skipPowerEnv = false;
+
+bool waitAppliedPmicConfig(uint16_t inputLimit, uint16_t chargeCurrent, system_tick_t timeout = 10000) {
+    for (auto start = millis(); millis() - start <= timeout;) {
+        PMIC power(true);
+        if (power.getInputCurrentLimit() == inputLimit && power.getChargeCurrentValue() == chargeCurrent) {
+            return true;
+        }
+        delay(250);
+    }
+    return false;
+}
+
+} // anonymous
+
+#endif // POWER_ENV_TESTS
+
+test(18_particle_power_env_init) {
+#if POWER_ENV_TESTS
+    {
+        // Scope the PMIC lock to the presence probe: holding it across
+        // System.setPowerConfiguration() can deadlock with the power manager
+        // thread, which takes the same lock while processing events
+        PMIC power(true);
+        power.begin();
+        skipPowerEnv = (power.getVersion() != BQ24195_VERSION);
+    }
+    if (skipPowerEnv) {
+        skip();
+        return;
+    }
+    // Reset the power configuration to defaults and use the VIN settings also when
+    // powered by a USB host, so that the applied input current limit is deterministic
+    // on the test rig regardless of the power source
+    SystemPowerConfiguration conf;
+    conf.feature(SystemPowerFeature::USE_VIN_SETTINGS_WITH_USB_HOST);
+#if HAL_PLATFORM_POWER_MANAGEMENT_OPTIONAL
+    conf.feature(SystemPowerFeature::PMIC_DETECTION);
+#endif
+    assertEqual(System.setPowerConfiguration(conf), 0);
+    System.enableFeature(FEATURE_RESET_INFO); // For the reset reason check in the next test
+    System.clearEnv(false /* reset */);
+    expectSystemReset();
+    System.reset();
+#else
+    skip();
+#endif // POWER_ENV_TESTS
+}
+
+test(19_particle_power_env_default) {
+#if POWER_ENV_TESTS
+    if (skipPowerEnv) {
+        skip();
+        return;
+    }
+    // Diagnostic: distinguish a clean reset (RESET_REASON_USER) from a crash
+    // (RESET_REASON_PANIC) in the preceding init test
+    Test::out->printlnf("resetReason: %d", (int)System.resetReason());
+    assertFalse(System.hasEnv("PARTICLE_PMIC_INPUT_CURRENT"));
+    assertFalse(System.hasEnv("PARTICLE_PMIC_CHARGE_CURRENT"));
+
+    // The stored configuration reports the defaults
+    auto conf = System.getPowerConfiguration();
+    assertEqual((int)conf.powerSourceMaxCurrent(), (int)DEFAULT_PMIC_INPUT_CURRENT_LIMIT);
+    assertEqual((int)conf.batteryChargeCurrent(), (int)DEFAULT_PMIC_CHARGE_CURRENT);
+
+    // The defaults are applied to the PMIC
+    assertTrue(waitAppliedPmicConfig(DEFAULT_PMIC_INPUT_CURRENT_LIMIT, DEFAULT_PMIC_CHARGE_CURRENT));
+#else
+    skip();
+#endif // POWER_ENV_TESTS
+}
+
+test(20_particle_power_env_override) {
+#if POWER_ENV_TESTS
+    if (skipPowerEnv) {
+        skip();
+        return;
+    }
+    int value = 0;
+    assertTrue(System.hasEnv("PARTICLE_PMIC_INPUT_CURRENT"));
+    assertTrue(System.getEnv("PARTICLE_PMIC_INPUT_CURRENT", value));
+    assertEqual(value, (int)POWER_ENV_INPUT_CURRENT_LIMIT);
+    assertTrue(System.hasEnv("PARTICLE_PMIC_CHARGE_CURRENT"));
+    assertTrue(System.getEnv("PARTICLE_PMIC_CHARGE_CURRENT", value));
+    assertEqual(value, (int)POWER_ENV_CHARGE_CURRENT);
+
+    // The env var values are applied to the PMIC
+    assertTrue(waitAppliedPmicConfig(POWER_ENV_INPUT_CURRENT_LIMIT, POWER_ENV_CHARGE_CURRENT));
+
+    // The stored configuration is not modified by the env var override
+    auto conf = System.getPowerConfiguration();
+    assertEqual((int)conf.powerSourceMaxCurrent(), (int)DEFAULT_PMIC_INPUT_CURRENT_LIMIT);
+    assertEqual((int)conf.batteryChargeCurrent(), (int)DEFAULT_PMIC_CHARGE_CURRENT);
+#else
+    skip();
+#endif // POWER_ENV_TESTS
+}
+
+test(21_particle_power_env_charge_above_input_limit) {
+#if POWER_ENV_TESTS
+    if (skipPowerEnv) {
+        skip();
+        return;
+    }
+    int value = 0;
+    assertTrue(System.getEnv("PARTICLE_PMIC_INPUT_CURRENT", value));
+    assertEqual(value, (int)POWER_ENV_INPUT_CURRENT_LIMIT);
+    assertTrue(System.getEnv("PARTICLE_PMIC_CHARGE_CURRENT", value));
+    assertEqual(value, (int)POWER_ENV_EXCESSIVE_CHARGE_CURRENT);
+
+    // The charge current is applied as requested even above the input current limit;
+    // the PMIC's VINDPM loop throttles charging at runtime
+    assertTrue(waitAppliedPmicConfig(POWER_ENV_INPUT_CURRENT_LIMIT, POWER_ENV_EXCESSIVE_CHARGE_CURRENT));
+#else
+    skip();
+#endif // POWER_ENV_TESTS
+}
+
+test(22_particle_power_env_restore_init) {
+#if POWER_ENV_TESTS
+    if (skipPowerEnv) {
+        skip();
+        return;
+    }
+    System.clearEnv(false /* reset */);
+    expectSystemReset();
+    System.reset();
+#else
+    skip();
+#endif // POWER_ENV_TESTS
+}
+
+test(23_particle_power_env_restore) {
+#if POWER_ENV_TESTS
+    if (skipPowerEnv) {
+        skip();
+        return;
+    }
+    assertFalse(System.hasEnv("PARTICLE_PMIC_INPUT_CURRENT"));
+    assertFalse(System.hasEnv("PARTICLE_PMIC_CHARGE_CURRENT"));
+
+    // The defaults are restored
+    assertTrue(waitAppliedPmicConfig(DEFAULT_PMIC_INPUT_CURRENT_LIMIT, DEFAULT_PMIC_CHARGE_CURRENT));
+
+    // Restore the default power configuration
+    SystemPowerConfiguration conf;
+#if HAL_PLATFORM_POWER_MANAGEMENT_OPTIONAL
+    conf.feature(SystemPowerFeature::PMIC_DETECTION);
+#endif
+    assertEqual(System.setPowerConfiguration(conf), 0);
+#else
+    skip();
+#endif // POWER_ENV_TESTS
+}
 
 test(97_cleanup) {
     System.clearEnv(false /* reset */);

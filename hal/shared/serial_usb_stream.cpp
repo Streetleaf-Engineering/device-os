@@ -26,6 +26,7 @@
 #include "timer_hal.h"
 #include "service_debug.h"
 #include "system_error.h"
+#include <algorithm>
 #if HAL_PLATFORM_NRF52840
 #include "usb_hal_cdc.h"
 #endif
@@ -82,7 +83,7 @@ int SerialUSBStream::read(char* data, size_t size) {
     if (size == 0) {
         return 0;
     }
-    
+
     return hal_usb_cdc_pvt_recv_data(data, size);
 }
 
@@ -92,17 +93,8 @@ int SerialUSBStream::peek(char* data, size_t size) {
     }
     if (size == 0) {
         return 0;
-    } else if (size > 1) {
-        // Only support peeking first byte
-        return SYSTEM_ERROR_NOT_SUPPORTED;
     }
-
-    auto r = HAL_USB_USART_Receive_Data(serial_, 1);
-    if (r >= 0) {
-        *data = r;
-    }
-
-    return r;
+    return HAL_USB_USART_Peek_Buffer(serial_, data, size);
 }
 
 int SerialUSBStream::skip(size_t size) {
@@ -116,8 +108,18 @@ int SerialUSBStream::write(const char* data, size_t size) {
     if (size == 0) {
         return 0;
     }
-    
-    return hal_usb_cdc_pvt_send_data(data, size);
+
+    int32_t available = HAL_USB_USART_Available_Data_For_Write(serial_);
+    if (available <= 0) {
+        return 0;
+    }
+
+    size_t writeSize = std::min((size_t)available, size);
+    auto r = hal_usb_cdc_pvt_send_data(data, writeSize);
+    if (r < 0) {
+        return r;
+    }
+    return r;
 }
 
 int SerialUSBStream::flush() {

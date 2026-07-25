@@ -78,10 +78,16 @@ class TxLock {
 public:
     TxLock(NRF_UARTE_Type* uarte)
             : uarte_(uarte) {
+        taskENTER_CRITICAL();
         nrf_uarte_int_disable(uarte, NRF_UARTE_INT_ENDTX_MASK);
+        __DSB();
+        __ISB();
     }
     ~TxLock() {
         nrf_uarte_int_enable(uarte_, NRF_UARTE_INT_ENDTX_MASK);
+        taskEXIT_CRITICAL();
+        __DSB();
+        __ISB();
     }
 
 private:
@@ -359,10 +365,18 @@ public:
 
     ssize_t peek(uint8_t* buffer, size_t size) {
         CHECK_TRUE(isEnabled(), SYSTEM_ERROR_INVALID_STATE);
-        const ssize_t maxRead = CHECK(data());
+        size_t consumable = 0;
+        const ssize_t maxRead = CHECK(data(&consumable));
         const size_t peekSize = std::min((size_t)maxRead, size);
         CHECK_TRUE(peekSize > 0, SYSTEM_ERROR_NO_MEMORY);
         RxLock lk(uarte_);
+        if (consumable > 0) {
+            CHECK(data(&consumable));
+            if (consumable > 0) {
+                rxBuffer_.acquireCommit(consumable);
+                rxConsumed_ += consumable;
+            }
+        }
         return rxBuffer_.peek(buffer, peekSize);
     }
 
@@ -375,9 +389,8 @@ public:
         {
             TxLock lk(uarte_);
             r = CHECK(txBuffer_.put(buffer, writeSize));
+            startTransmission();
         }
-        // Start transmission
-        startTransmission();
         return r;
     }
 
@@ -573,11 +586,14 @@ private:
     void startTransmission() {
         size_t consumable;
         if (!transmitting_ && (consumable = txBuffer_.consumable())) {
-            transmitting_ = true;
             auto ptr = txBuffer_.consume(consumable);
 #ifdef DEBUG_BUILD
             SPARK_ASSERT(ptr);
 #endif // DEBUG_BUILD
+            if (!ptr) {
+                return;
+            }
+            transmitting_ = true;
             nrf_uarte_event_clear(uarte_, NRF_UARTE_EVENT_TXDRDY);
             nrf_uarte_event_clear(uarte_, NRF_UARTE_EVENT_ENDTX);
             nrf_uarte_event_clear(uarte_, NRF_UARTE_EVENT_TXSTOPPED);
@@ -929,20 +945,20 @@ bool hal_usart_is_enabled(hal_usart_interface_t serial) {
     return usart->isEnabled();
 }
 
-ssize_t hal_usart_write_buffer(hal_usart_interface_t serial, const void* buffer, size_t size, size_t elementSize) {
+int hal_usart_write_buffer(hal_usart_interface_t serial, const void* buffer, size_t size, size_t elementSize) {
     auto usart = CHECK_TRUE_RETURN(getInstance(serial), SYSTEM_ERROR_NOT_FOUND);
     CHECK_TRUE(elementSize == sizeof(uint8_t), SYSTEM_ERROR_INVALID_ARGUMENT);
     usart->pump();
     return usart->write((const uint8_t*)buffer, size);
 }
 
-ssize_t hal_usart_read_buffer(hal_usart_interface_t serial, void* buffer, size_t size, size_t elementSize) {
+int hal_usart_read_buffer(hal_usart_interface_t serial, void* buffer, size_t size, size_t elementSize) {
     auto usart = CHECK_TRUE_RETURN(getInstance(serial), SYSTEM_ERROR_NOT_FOUND);
     CHECK_TRUE(elementSize == sizeof(uint8_t), SYSTEM_ERROR_INVALID_ARGUMENT);
     return usart->read((uint8_t*)buffer, size);
 }
 
-ssize_t hal_usart_peek_buffer(hal_usart_interface_t serial, void* buffer, size_t size, size_t elementSize) {
+int hal_usart_peek_buffer(hal_usart_interface_t serial, void* buffer, size_t size, size_t elementSize) {
     auto usart = CHECK_TRUE_RETURN(getInstance(serial), SYSTEM_ERROR_NOT_FOUND);
     CHECK_TRUE(elementSize == sizeof(uint8_t), SYSTEM_ERROR_INVALID_ARGUMENT);
     return usart->peek((uint8_t*)buffer, size);
@@ -1009,6 +1025,11 @@ int hal_usart_pvt_disable_event(hal_usart_interface_t serial, HAL_USART_Pvt_Even
 int hal_usart_pvt_wait_event(hal_usart_interface_t serial, uint32_t events, system_tick_t timeout) {
     auto usart = CHECK_TRUE_RETURN(getInstance(serial), SYSTEM_ERROR_NOT_FOUND);
     return usart->waitEvent(events, timeout);
+}
+
+int hal_usart_wait_event(hal_usart_interface_t serial, uint32_t events, system_tick_t timeout, void* reserved) {
+    (void)reserved;
+    return hal_usart_pvt_wait_event(serial, events, timeout);
 }
 
 int hal_usart_sleep(hal_usart_interface_t serial, bool sleep, void* reserved) {

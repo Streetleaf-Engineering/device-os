@@ -21,6 +21,7 @@
 #include "usbd_control.h"
 #include "usbd_driver.h"
 #include "usbd_cdc.h"
+#include <algorithm>
 #include <mutex>
 #include "usb_settings.h"
 #include "usbd_hid.h"
@@ -110,29 +111,40 @@ void HAL_USB_USART_Init(HAL_USB_USART_Serial serial, const HAL_USB_USART_Config*
     if (serial != HAL_USB_USART_SERIAL) {
         return;
     }
-    if (getCdcClassDriver().isEnabled()) {
-        return;
+    const bool haveConfig = (config != nullptr &&
+            config->rx_buffer != nullptr && config->rx_buffer_size != 0 &&
+            config->tx_buffer != nullptr && config->tx_buffer_size != 0);
+
+    const bool reconfigure = getCdcClassDriver().isEnabled();
+    if (reconfigure) {
+        if (!haveConfig) {
+            return;
+        }
+        HAL_USB_Detach();
+        getCdcClassDriver().enable(false);
     }
-    // FIXME: figure out what's going on here
-    if (!config ||
-            (config->rx_buffer == nullptr ||
-             config->rx_buffer_size == 0 ||
-             config->tx_buffer == nullptr ||
-             config->tx_buffer_size == 0)) {
-        uint8_t* txBuffer = (uint8_t*)malloc(USB_TX_BUFFER_SIZE);
-        uint8_t* rxBuffer = (uint8_t*)malloc(USB_RX_BUFFER_SIZE);
-        if (txBuffer && rxBuffer) {
-            getCdcClassDriver().initBuffers(rxBuffer, USB_RX_BUFFER_SIZE, txBuffer, USB_TX_BUFFER_SIZE);
-        } else {
-            if (txBuffer) {
-                free(txBuffer);
-            }
-            if (rxBuffer) {
-                free(rxBuffer);
-            }
+
+    if (!haveConfig) {
+        // Reused across calls to avoid leaking on repeated default init (matches Gen 3).
+        static uint8_t* sTxBuffer = nullptr;
+        static uint8_t* sRxBuffer = nullptr;
+        if (!sTxBuffer) {
+            sTxBuffer = (uint8_t*)malloc(USB_TX_BUFFER_SIZE);
+        }
+        if (!sRxBuffer) {
+            sRxBuffer = (uint8_t*)malloc(USB_RX_BUFFER_SIZE);
+        }
+        if (sTxBuffer && sRxBuffer) {
+            getCdcClassDriver().initBuffers(sRxBuffer, USB_RX_BUFFER_SIZE, sTxBuffer, USB_TX_BUFFER_SIZE);
         }
     } else {
         getCdcClassDriver().initBuffers(config->rx_buffer, config->rx_buffer_size, config->tx_buffer, config->tx_buffer_size);
+    }
+
+    if (reconfigure) {
+        getCdcClassDriver().enable(true);
+        HAL_USB_Init();
+        HAL_USB_Attach();
     }
 }
 
@@ -217,13 +229,6 @@ int32_t HAL_USB_USART_Receive_Data(HAL_USB_USART_Serial serial, uint8_t peek) {
 int32_t HAL_USB_USART_Receive_Data_protected(HAL_USB_USART_Serial serial, uint8_t peek) {
     CHECK_SECURITY_MODE_PROTECTED();
     return HAL_USB_USART_Receive_Data(serial, peek);
-}
-
-static int32_t HAL_USB_USART_Receive_Data_Multiple(HAL_USB_USART_Serial serial, uint8_t* data, size_t size) {
-    if (serial != HAL_USB_USART_SERIAL) {
-        return SYSTEM_ERROR_INVALID_ARGUMENT;
-    }
-    return getCdcClassDriver().read(data, size);
 }
 
 static int32_t HAL_USB_USART_Send_Data_Multiple(HAL_USB_USART_Serial serial, const uint8_t* data, size_t size) {
@@ -327,15 +332,90 @@ int hal_usb_cdc_pvt_get_event_group_handle(EventGroupHandle_t* handle) {
 }
 
 int hal_usb_cdc_pvt_wait_event(uint32_t events, system_tick_t timeout) {
-    return getCdcClassDriver().waitEvent(events, timeout);
+    return HAL_USB_USART_Wait_Event(HAL_USB_USART_SERIAL, events, timeout, nullptr);
 }
 
 int hal_usb_cdc_pvt_send_data(const char* data, size_t size) {
-    return HAL_USB_USART_Send_Data_Multiple(HAL_USB_USART_SERIAL, (uint8_t*)data, size);
+    return HAL_USB_USART_Send_Buffer(HAL_USB_USART_SERIAL, data, size);
 }
 
 int hal_usb_cdc_pvt_recv_data(char* data, size_t size) {
-    return HAL_USB_USART_Receive_Data_Multiple(HAL_USB_USART_SERIAL, (uint8_t*)data, size);
+    return HAL_USB_USART_Receive_Buffer(HAL_USB_USART_SERIAL, data, size);
+}
+
+int32_t HAL_USB_USART_Send_Buffer(HAL_USB_USART_Serial serial, const void* data, size_t size) {
+    if (serial != HAL_USB_USART_SERIAL) {
+        return SYSTEM_ERROR_INVALID_ARGUMENT;
+    }
+    if (size == 0) {
+        return 0;
+    }
+    if ((__get_PRIMASK() & 1) || (__get_BASEPRI() != 0)) {
+        return SYSTEM_ERROR_INVALID_STATE;
+    }
+    if (!HAL_USB_USART_Is_Connected(serial)) {
+        return SYSTEM_ERROR_INVALID_STATE;
+    }
+    int32_t available = HAL_USB_USART_Available_Data_For_Write(serial);
+    if (available < 0) {
+        return SYSTEM_ERROR_INVALID_STATE;
+    }
+    if (available == 0) {
+        return 0;
+    }
+    size_t writeSize = std::min((size_t)available, size);
+    return getCdcClassDriver().write((const uint8_t*)data, writeSize);
+}
+
+int32_t HAL_USB_USART_Receive_Buffer(HAL_USB_USART_Serial serial, void* data, size_t size) {
+    if (serial != HAL_USB_USART_SERIAL) {
+        return SYSTEM_ERROR_INVALID_ARGUMENT;
+    }
+    if (size == 0) {
+        return 0;
+    }
+    return getCdcClassDriver().read((uint8_t*)data, size);
+}
+
+int32_t HAL_USB_USART_Peek_Buffer(HAL_USB_USART_Serial serial, void* data, size_t size) {
+    if (serial != HAL_USB_USART_SERIAL) {
+        return SYSTEM_ERROR_INVALID_ARGUMENT;
+    }
+    if (size == 0) {
+        return 0;
+    }
+    return getCdcClassDriver().peek((uint8_t*)data, size);
+}
+
+int HAL_USB_USART_Wait_Event(HAL_USB_USART_Serial serial, uint32_t events, system_tick_t timeout, void* reserved) {
+    if (serial != HAL_USB_USART_SERIAL) {
+        return SYSTEM_ERROR_INVALID_ARGUMENT;
+    }
+    (void)reserved;
+    if (!events) {
+        return 0;
+    }
+    return getCdcClassDriver().waitEvent(events, timeout);
+}
+
+int32_t HAL_USB_USART_Send_Buffer_protected(HAL_USB_USART_Serial serial, const void* data, size_t size) {
+    CHECK_SECURITY_MODE_PROTECTED();
+    return HAL_USB_USART_Send_Buffer(serial, data, size);
+}
+
+int32_t HAL_USB_USART_Receive_Buffer_protected(HAL_USB_USART_Serial serial, void* data, size_t size) {
+    CHECK_SECURITY_MODE_PROTECTED();
+    return HAL_USB_USART_Receive_Buffer(serial, data, size);
+}
+
+int32_t HAL_USB_USART_Peek_Buffer_protected(HAL_USB_USART_Serial serial, void* data, size_t size) {
+    CHECK_SECURITY_MODE_PROTECTED();
+    return HAL_USB_USART_Peek_Buffer(serial, data, size);
+}
+
+int HAL_USB_USART_Wait_Event_protected(HAL_USB_USART_Serial serial, uint32_t events, system_tick_t timeout, void* reserved) {
+    CHECK_SECURITY_MODE_PROTECTED();
+    return HAL_USB_USART_Wait_Event(serial, events, timeout, reserved);
 }
 #ifdef __cplusplus
 }
